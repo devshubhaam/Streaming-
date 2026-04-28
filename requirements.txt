@@ -2,3 +2,4 @@ telethon
 flask
 flask-cors
 cryptg
+requests
