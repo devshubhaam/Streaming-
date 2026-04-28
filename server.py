@@ -1,85 +1,43 @@
 import os
+import math
 import asyncio
 import threading
-import requests
 from flask import Flask, request, Response, send_from_directory
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+from pyrogram import Client
 
 app = Flask(__name__, static_folder='public')
 
-API_ID       = int(os.environ['API_ID'])
-API_HASH     = os.environ['API_HASH']
-SESSION      = os.environ['SESSION_STRING']
-BOT_TOKEN    = os.environ.get('BOT_TOKEN', '')  # optional, for getFile fallback
-CHUNK_SIZE   = 512 * 1024  # 512KB
+API_ID   = int(os.environ['API_ID'])
+API_HASH = os.environ['API_HASH']
+SESSION  = os.environ['SESSION_STRING']  # Pyrogram session string
 
-# ── One persistent event loop in background thread ──
+CHUNK_SIZE = 1024 * 1024  # 1MB
+
+# ── Background event loop ──
 _loop = asyncio.new_event_loop()
-
-def _start_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-threading.Thread(target=_start_loop, args=(_loop,), daemon=True).start()
+threading.Thread(target=_loop.run_forever, daemon=True).start()
 
 def run_async(coro):
-    future = asyncio.run_coroutine_threadsafe(coro, _loop)
-    return future.result()
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result()
 
-# ── Persistent Telegram client (MTProto) ──
-_client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+# ── Pyrogram client ──
+_client = Client(
+    name="tgstream",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    session_string=SESSION,
+    in_memory=True,
+    no_updates=True,
+)
 
-async def _connect():
-    await _client.connect()
-    print('✅ Telegram MTProto connected')
+run_async(_client.start())
+print("✅ Pyrogram connected")
 
-run_async(_connect())
-
-# ── file_id -> media object cache ──
-_media_cache = {}
-
-async def _resolve_media(file_id: str):
-    """Get Telethon media object from a Bot API file_id string."""
-    if file_id in _media_cache:
-        return _media_cache[file_id]
-
-    # Use Bot API getFile to get the file_path
-    if not BOT_TOKEN:
-        raise Exception('BOT_TOKEN not set — needed to resolve file_id')
-
-    r = requests.get(
-        f'https://api.telegram.org/bot{BOT_TOKEN}/getFile',
-        params={'file_id': file_id},
-        timeout=10
-    )
-    data = r.json()
-    if not data.get('ok'):
-        raise Exception(f"Telegram getFile error: {data.get('description')}")
-
-    file_path = data['result']['file_path']
-    file_url  = f'https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}'
-
-    # Store URL for direct streaming
-    _media_cache[file_id] = {'url': file_url, 'type': 'url'}
-    return _media_cache[file_id]
-
-async def _get_message_media(file_id: str):
-    """
-    Alternative: search recent messages for this file_id to get Telethon media.
-    Uses 'me' (saved messages) as the search space.
-    """
-    if file_id in _media_cache:
-        return _media_cache[file_id]
-
-    async for msg in _client.iter_messages('me', limit=200):
-        if msg.media and hasattr(msg.media, 'document'):
-            doc = msg.media.document
-            if doc.id and str(doc.id) in file_id:
-                _media_cache[file_id] = msg.media
-                return msg.media
-    return None
+async def _stream_chunk(file_id: str, offset: int, parts: int) -> bytes:
+    data = b''
+    async for chunk in _client.stream_media(file_id, offset=offset, limit=parts):
+        data += chunk
+    return data
 
 # ── Routes ──
 
@@ -101,40 +59,39 @@ def stream_video(file_id):
         except Exception:
             start = 0
 
-    try:
-        media_info = run_async(_resolve_media(file_id))
-    except Exception as e:
-        return {'error': str(e)}, 500
+    limit = (end - start + 1) if end else CHUNK_SIZE
 
-    # Stream directly from Telegram CDN URL with range
-    tg_url = media_info['url']
-    req_headers = {}
-    if range_header:
-        req_headers['Range'] = range_header
-
-    tg_resp = requests.get(tg_url, headers=req_headers, stream=True, timeout=30)
+    # Pyrogram needs 1MB-aligned offsets
+    part_size   = 1024 * 1024
+    first_part  = math.floor(start / part_size)
+    last_part   = math.ceil((start + limit) / part_size)
+    tg_offset   = first_part * part_size
+    skip_bytes  = start - tg_offset
+    parts_count = last_part - first_part
 
     def generate():
-        for chunk in tg_resp.iter_content(chunk_size=CHUNK_SIZE):
-            if chunk:
-                yield chunk
+        try:
+            data = run_async(_stream_chunk(file_id, tg_offset, parts_count))
+            yield data[skip_bytes: skip_bytes + limit]
+        except Exception as e:
+            print(f"Stream error: {e}")
+            yield b''
 
-    resp_headers = {
-        'Accept-Ranges': 'bytes',
-        'Content-Type': tg_resp.headers.get('Content-Type', 'video/mp4'),
-        'Cache-Control': 'no-cache',
+    headers = {
+        'Accept-Ranges':  'bytes',
+        'Content-Type':   'video/mp4',
+        'Cache-Control':  'no-cache',
+        'Content-Length': str(limit),
     }
 
-    if 'Content-Range' in tg_resp.headers:
-        resp_headers['Content-Range'] = tg_resp.headers['Content-Range']
-    if 'Content-Length' in tg_resp.headers:
-        resp_headers['Content-Length'] = tg_resp.headers['Content-Length']
+    if range_header:
+        end_byte = start + limit - 1
+        headers['Content-Range'] = f'bytes {start}-{end_byte}/*'
+        return Response(generate(), status=206, headers=headers)
 
-    status = tg_resp.status_code  # 206 if range, 200 otherwise
-
-    return Response(generate(), status=status, headers=resp_headers)
+    return Response(generate(), status=200, headers=headers)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
-    print(f'🚀 TGStream running on port {port}')
+    print(f'🚀 TGStream (Pyrogram) on port {port}')
     app.run(host='0.0.0.0', port=port, threaded=True)
