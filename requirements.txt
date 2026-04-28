@@ -1,5 +1,4 @@
-telethon
+pyrogram
+tgcrypto
 flask
 flask-cors
-cryptg
-requests
